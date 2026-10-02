@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rock Skipping - direct test</title>
+<style>
+  body { font: 18px/1.4 system-ui, sans-serif; margin: 0; padding: 16px; background: #10202b; color: #eef4f7; }
+  h1 { font-size: 22px; margin: 0 0 12px; }
+  .state { font-size: 26px; font-weight: 700; margin: 12px 0; }
+  .ok { color: #7be08f; } .bad { color: #ff8a80; } .wait { color: #ffd479; }
+  button { font-size: 22px; padding: 18px; width: 100%; margin: 10px 0; border: 0; border-radius: 10px; background: #2f7fb5; color: #fff; }
+  button:disabled { background: #4b5a63; }
+  .stats { font-size: 20px; }
+  pre { white-space: pre-wrap; font-size: 13px; background: #0a151c; padding: 10px; border-radius: 8px; }
+</style>
+</head>
+<body>
+<h1>Rock Skipping - direct connection test</h1>
+<div id="state" class="state wait">Starting…</div>
+<div class="stats" id="stats">Round trip: waiting for data</div>
+<button id="motion">Start motion sensors</button>
+<div class="stats" id="tilt">Motion: not started</div>
+<button id="throw" disabled>Throw (sends a message to the PC)</button>
+<button id="retry">Reconnect</button>
+<pre id="log"></pre>
+<script>
+const logEl = document.getElementById('log');
+const stateEl = document.getElementById('state');
+const statsEl = document.getElementById('stats');
+const throwBtn = document.getElementById('throw');
+function log(text) { logEl.textContent += new Date().toLocaleTimeString() + '  ' + text + '\n'; }
+function setState(text, cls) { stateEl.textContent = text; stateEl.className = 'state ' + cls; }
+
+log('Secure page: ' + window.isSecureContext + ', WebRTC available: ' + ('RTCPeerConnection' in window));
+log('Browser: ' + navigator.userAgent);
+
+let pc = null, dc = null, pingTimer = null, statsTimer = null, aimTimer = null;
+let tilt = null, motionEvents = 0;
+let rtts = [];
+
+function randomId() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes, (b) => chars[b % chars.length]).join('');
+}
+
+function percentile(sorted, p) { return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]; }
+
+async function connect() {
+  clearInterval(pingTimer); clearInterval(statsTimer);
+  if (pc) pc.close();
+  rtts = [];
+  throwBtn.disabled = true;
+  const q = new URLSearchParams(location.hash.slice(1));
+  const ip = q.get('ip'), port = q.get('port'), fp = q.get('fp');
+  if (!ip || !port || !fp) { setState('This link is missing the PC details. Scan the QR again.', 'bad'); return; }
+  if (!('RTCPeerConnection' in window)) { setState('This browser has no WebRTC.', 'bad'); return; }
+
+  // Everything known about the PC comes from the link (the QR). Our random id is used as both
+  // sides' ICE username and password, so the PC can recognise us from our first check.
+  const id = randomId();
+  setState('Connecting to ' + ip + '…', 'wait');
+  log('Dialling ' + ip + ':' + port);
+  pc = new RTCPeerConnection();
+  dc = pc.createDataChannel('game');
+  pc.onconnectionstatechange = () => {
+    log('Connection: ' + pc.connectionState);
+    if (pc.connectionState === 'failed') setState('Could not connect (see the log below)', 'bad');
+    if (pc.connectionState === 'disconnected') setState('Connection lost', 'bad');
+  };
+  const offer = await pc.createOffer();
+  offer.sdp = offer.sdp
+    .replace(/a=ice-ufrag:.*\r\n/g, 'a=ice-ufrag:' + id + '\r\n')
+    .replace(/a=ice-pwd:.*\r\n/g, 'a=ice-pwd:' + id + '\r\n');
+  await pc.setLocalDescription(offer);
+  const answer = [
+    'v=0', 'o=- 0 0 IN IP4 0.0.0.0', 's=-', 't=0 0', 'a=group:BUNDLE 0', 'a=ice-lite',
+    'm=application ' + port + ' UDP/DTLS/SCTP webrtc-datachannel',
+    'c=IN IP4 ' + ip, 'a=mid:0',
+    'a=ice-ufrag:' + id, 'a=ice-pwd:' + id,
+    'a=fingerprint:sha-256 ' + fp, 'a=setup:passive', 'a=sctp-port:5000',
+    'a=candidate:1 1 udp 2130706431 ' + ip + ' ' + port + ' typ host',
+    'a=end-of-candidates', '',
+  ].join('\r\n');
+  await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+
+  const timeout = setTimeout(() => {
+    if (dc.readyState !== 'open') setState('No answer from the PC after 15 s (see the log below)', 'bad');
+  }, 15000);
+
+  dc.onopen = () => {
+    clearTimeout(timeout);
+    setState('Connected directly to the PC', 'ok');
+    log('Direct channel open');
+    throwBtn.disabled = false;
+    // 20 messages a second, the same rate the game sends aim updates.
+    pingTimer = setInterval(() => { if (dc.readyState === 'open') dc.send('PING ' + performance.now()); }, 50);
+    statsTimer = setInterval(reportStats, 1000);
+  };
+  dc.onclose = () => { log('Channel closed'); throwBtn.disabled = true; };
+  dc.onmessage = (e) => {
+    if (e.data.startsWith('PONG ')) {
+      rtts.push(performance.now() - parseFloat(e.data.slice(5)));
+      if (rtts.length > 400) rtts.shift();
+    } else if (e.data === 'THROW-OK') {
+      log('PC received the throw');
+    }
+  };
+}
+
+// iPhones only hand out motion data after a tap and a permission prompt; Android needs neither,
+// but both need a secure (HTTPS) page.
+async function startMotion() {
+  const tiltEl = document.getElementById('tilt');
+  if (!window.isSecureContext) { tiltEl.textContent = 'Motion: blocked, this page is not HTTPS'; return; }
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      const answer = await DeviceOrientationEvent.requestPermission();
+      log('Motion permission: ' + answer);
+      if (answer !== 'granted') { tiltEl.textContent = 'Motion: permission ' + answer; return; }
+    }
+  } catch (e) { log('Motion permission error: ' + e); tiltEl.textContent = 'Motion: ' + e.message; return; }
+  window.addEventListener('deviceorientation', (e) => {
+    if (e.beta === null) return;
+    motionEvents++;
+    tilt = { b: e.beta, g: e.gamma, a: e.alpha };
+    tiltEl.textContent = 'Motion: front/back ' + e.beta.toFixed(0) + ', left/right ' + e.gamma.toFixed(0) + ' (' + motionEvents + ' readings)';
+  });
+  setTimeout(() => { if (motionEvents === 0) tiltEl.textContent = 'Motion: started, but no readings yet'; }, 2000);
+  document.getElementById('motion').disabled = true;
+  log('Motion sensors started');
+  clearInterval(aimTimer);
+  // 20 a second, the game's aim rate.
+  aimTimer = setInterval(() => { if (tilt && dc && dc.readyState === 'open') dc.send('AIM ' + JSON.stringify(tilt)); }, 50);
+}
+
+function reportStats() {
+  if (rtts.length === 0) return;
+  const sorted = [...rtts].sort((a, b) => a - b);
+  const median = percentile(sorted, 0.5), p95 = percentile(sorted, 0.95);
+  statsEl.textContent = 'Round trip: typical ' + median.toFixed(1) + ' ms, slow (95%) ' + p95.toFixed(1) + ' ms, ' + sorted.length + ' samples';
+  const device = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.userAgent.split(')')[0].split('(')[1] || 'phone';
+  dc.send('STATS ' + JSON.stringify({ device, median, p95, samples: sorted.length, secure: window.isSecureContext }));
+}
+
+document.getElementById('motion').onclick = () => startMotion();
+throwBtn.onclick = () => { if (dc && dc.readyState === 'open') dc.send('THROW'); };
+document.getElementById('retry').onclick = () => connect().catch((e) => { log('Error: ' + e); setState('Error: ' + e.message, 'bad'); });
+connect().catch((e) => { log('Error: ' + e); setState('Error: ' + e.message, 'bad'); });
+</script>
+</body>
+</html>
